@@ -35,7 +35,10 @@
   #toast { position:fixed; right:20px; bottom:20px; max-width:420px; z-index:99; }
   .toast-item { padding:10px 14px; border-radius:6px; margin-top:8px; font-size:13px; color:#fff; box-shadow:0 4px 14px rgba(0,0,0,.18); }
   .toast-item.ok { background:var(--ok); } .toast-item.err { background:var(--err); } .toast-item.info { background:#334; }
-  input[type=file] { font-size:12px; }
+  .banner { border-radius:6px; padding:10px 12px; margin:0 0 12px; font-size:13px; display:none; }
+  .banner.show { display:block; }
+  .banner.stale { background:#fdecea; border:1px solid #f5b7b1; color:var(--err); }
+  .banner .row { margin-top:8px; }
   code { background:#eef1f5; padding:1px 5px; border-radius:4px; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   @media (max-width:860px){ .grid2{grid-template-columns:1fr;} }
@@ -71,12 +74,39 @@
       <button class="danger" onclick="resetAll()">清空全部数据</button>
       <span class="hint" id="counts"></span>
     </div>
+    <hr style="border:none;border-top:1px dashed var(--bd);margin:14px 0">
+    <p class="hint" style="margin-top:0">
+      <strong>过期建议演示</strong>：先点「载入过期建议演示（E710）」，此时 PO7100 为确定配对；
+      再点「另一窗口：同员工补录 100 分」，本页<strong>不刷新</strong>，仍停留在补录前的建议。
+      此时确认原配对会被服务端拒绝并提示刷新；刷新后可人工选择新的待核组合再确认。
+    </p>
+    <p class="hint" style="margin-top:0">
+      <strong>其他员工补录</strong>：点「另一窗口：其他员工补录 100 分」后，本页只需勾选 E710 的 PO7100
+      （取消勾选 E810 的 PO8100）即可确认成功——其他员工的变化不阻止本组；
+      E810 自身的建议依据已变，若要确认它需先刷新建议。
+    </p>
+    <div class="row">
+      <button class="secondary" onclick="loadStaleDemo()">载入过期建议演示（E710）</button>
+      <button class="secondary" onclick="otherWindowSame()">另一窗口：同员工补录 100 分</button>
+      <button class="secondary" onclick="otherWindowOther()">另一窗口：其他员工补录 100 分</button>
+    </div>
   </section>
 
   <section class="card">
     <h2>② 待确认匹配建议 <span id="maxInfo" class="badge none"></span>
-      <span class="hint">仅所有最优方案共有的配对标记为「确定」；存在歧义的列为「待核」，可人工选择后确认</span>
+      <button class="secondary" style="margin-left:auto" onclick="refresh()">刷新建议</button>
     </h2>
+    <div id="staleBanner" class="banner stale">
+      <strong>建议已过期。</strong><span id="staleText">同员工数据已被补录或确认，本页建议不再是当前已提交状态。</span>
+      本组确认已被拒绝且未写入任何数据。请刷新后重新人工选择待核组合；页面不会自动重提旧选择。
+      <div class="row"><button onclick="refresh()">刷新建议</button></div>
+    </div>
+    <p class="hint" style="margin-top:0">
+      本页建议依据：<code id="basisInfo">-</code>。确认时服务端会在写锁内核对同一依据；
+      同员工补录后旧页面的确认会整组拒绝，其他员工补录不影响本组。
+      仅所有最优方案共有的配对标记为「确定」；存在歧义的列为「待核」，可人工选择后确认。
+      <strong>本页不自动轮询</strong>：需要最新建议时请点右上角「刷新建议」。
+    </p>
     <h3 style="font-size:14px"><span class="badge certain">确定</span> 所有最优方案共有配对（最多匹配数口径）</h3>
     <div id="certainBox"><p class="muted">加载中…</p></div>
     <h3 style="font-size:14px;margin-top:16px"><span class="badge pending">待核</span> 存在合法组合但非所有最优方案共有，需人工判断</h3>
@@ -100,6 +130,8 @@
 
 <script>
 let STATE = null;
+let BASIS = null;          // 本页建议所属的已提交状态令牌
+let STALE = false;         // 服务器判定本页建议过期
 
 function toast(msg, kind="info") {
   const box = document.getElementById("toast");
@@ -112,7 +144,12 @@ function toast(msg, kind="info") {
 async function api(path, opts={}) {
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+  if (!res.ok) {
+    const err = new Error(data.detail || ("HTTP " + res.status));
+    err.status = res.status;
+    err.code = data.code;
+    throw err;
+  }
   return data;
 }
 function fmtAmt(cents) { return cents.toLocaleString("zh-CN") + " 分"; }
@@ -123,6 +160,10 @@ function render() {
   document.getElementById("counts").textContent =
     `当前开放：支付单 ${s.counts.open_orders}/${s.counts.max_orders} 张，回执 ${s.counts.open_receipts}/${s.counts.max_receipts} 条`;
   document.getElementById("maxInfo").textContent = `最优口径下最多可匹配 ${s.max_matched} 张支付单`;
+  document.getElementById("basisInfo").textContent = BASIS ? BASIS.slice(0, 24) + "…" : "-";
+  document.getElementById("staleBanner").classList.toggle("show", STALE);
+  // 过期后必须先刷新重建建议，禁止继续提交旧选择
+  document.getElementById("confirmBtn").disabled = STALE;
 
   // 确定
   const cb = document.getElementById("certainBox");
@@ -180,9 +221,10 @@ function orderBlock(order, combos, certain) {
   let body = "";
   combos.forEach((combo, idx) => {
     const sum = combo.receipts.reduce((a,b)=>a+b.amount,0);
+    const key = JSON.stringify(combo.receipts.map(r=>r.receipt_no));
     body += `<div class="combo"><label>
       <input type="checkbox" class="pick" data-order="${order.order_no}"
-        data-receipts='${JSON.stringify(combo.receipts.map(r=>r.receipt_no))}'
+        data-receipts='${key}'
         ${certain ? "checked" : ""}>
       <span>${combo.receipts.map(r =>
         `${r.receipt_no}（${r.employee_no}，${fmtAmt(r.amount)}）`).join(" + ")}
@@ -208,18 +250,33 @@ async function collectAndConfirm() {
 }
 
 async function confirmSelected() {
+  if (!BASIS) { toast("建议尚未加载完成", "err"); return; }
   const payload = await collectAndConfirm();
   if (!payload) return;
   if (!confirm(`将确认 ${payload.items.length} 张支付单的配对，确认后这些单据/回执不可再参与匹配。继续？`)) return;
   try {
-    const r = await api("/api/confirm", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+    // 提交本页建议所属的已提交状态；服务端在同员工数据变化后整组拒绝
+    const r = await api("/api/confirm", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({...payload, basis: BASIS})});
     toast(`确认成功（批次 #${r.confirmation_id}，${r.confirmed_items} 项），整组已落库`, "ok");
+    STALE = false;
     await refresh();
-  } catch (e) { toast("确认失败，数据未改动：" + e.message, "err"); }
+  } catch (e) {
+    if (e.code === "stale_suggestion") {
+      STALE = true;
+      render();
+      toast("建议已过期，确认被拒绝且未写入任何数据；请刷新后重新选择", "err");
+    } else {
+      toast("确认失败，数据未改动：" + e.message, "err");
+    }
+  }
 }
 
 async function refresh() {
+  // 主动拉取 = 以最新已提交状态重建建议；待核组合始终不预勾选，人工选择不跨刷新保留
   STATE = await api("/api/state");
+  BASIS = STATE.suggestion_basis;
+  STALE = false;
   render();
 }
 
@@ -250,10 +307,29 @@ async function resetAll() {
   try { await api("/api/reset", {method:"POST"}); toast("已清空", "ok"); await refresh(); }
   catch (e) { toast(e.message, "err"); }
 }
+async function loadStaleDemo() {
+  try { await api("/api/demo/stale", {method:"POST"}); toast("已载入 E710 过期建议演示，PO7100 当前为确定配对", "ok"); await refresh(); }
+  catch (e) { toast(e.message, "err"); }
+}
+async function otherWindowSame() {
+  // 模拟“另一个窗口”补录同员工数据：本页刻意不刷新，继续持有补录前的建议
+  try {
+    await api("/api/demo/stale/supplement-same", {method:"POST"});
+    toast("另一窗口已补录 E710 的 100 分回执；本页仍是补录前的建议，可尝试确认验证过期拦截", "info");
+  } catch (e) { toast(e.message, "err"); }
+}
+async function otherWindowOther() {
+  // 另一窗口补录其他员工 E810 的回执：本页不刷新，E710 的旧建议仍可确认
+  try {
+    await api("/api/demo/stale/supplement-other", {method:"POST"});
+    toast("另一窗口已补录其他员工 E810 的回执；本页确认 E710 的配对不受影响", "info");
+  } catch (e) { toast(e.message, "err"); }
+}
 function downloadEvidence() { window.location.href = "/api/evidence.csv"; }
 
 refresh().catch(e => toast("初始化失败：" + e.message, "err"));
-setInterval(() => refresh().catch(()=>{}), 5000); // 多窗口状态同步
+// 不自动轮询：旧页面必须保持补录前的建议，才能复现“过期建议”拦截。
+// 需要最新建议时由用户点「刷新建议」或执行本页自己的导入操作。
 </script>
 </body>
 </html>

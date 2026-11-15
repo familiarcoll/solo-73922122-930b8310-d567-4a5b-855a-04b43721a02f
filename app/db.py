@@ -5,14 +5,21 @@
 - receipts        银行回执（补录进同一批次；确认后被占用）
 - confirmations   一次确认动作（整组事务），对应一份可下载实付依据
 - confirmation_items  确认明细（支付单 ↔ 回执配对）
+- employee_revisions  员工维度的已提交状态版本（建议/确认依据一致性）
+
+匹配按员工相互独立（回执只与同员工支付单配对），因此每个员工的开放
+支付单/回执每发生一次变化就把该员工版本 +1。确认请求携带生成建议时的
+版本，服务端在写锁内重新读取比对；同员工补录后旧页面的确认必然过期，
+其他员工的变化不影响本组确认。
 """
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Iterable, Iterator, List, Sequence
+from typing import Dict, Iterable, Iterator, List, Sequence
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS payment_orders (
@@ -44,6 +51,14 @@ CREATE TABLE IF NOT EXISTS confirmation_items (
 );
 CREATE INDEX IF NOT EXISTS idx_items_conf ON confirmation_items(confirmation_id);
 CREATE INDEX IF NOT EXISTS idx_items_order ON confirmation_items(order_no);
+CREATE TABLE IF NOT EXISTS employee_revisions (
+    employee_no  TEXT PRIMARY KEY,
+    revision     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS app_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
 """
 
 MAX_ORDERS = 8
@@ -67,6 +82,32 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    with immediate_transaction(conn):
+        seed_employee_revisions(conn)
+
+
+def seed_employee_revisions(conn: sqlite3.Connection) -> None:
+    """为既有数据补齐版本行（只补缺，不重置已有版本）。
+
+    升级前已存在的员工数据也参与版本比对；此后任一补录/确认都会把版本 +1。
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO employee_revisions(employee_no, revision)"
+        " SELECT employee_no, 0 FROM payment_orders"
+        " UNION SELECT employee_no, 0 FROM receipts"
+    )
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读一致性快照：建议数据与员工版本必须来自同一次已提交状态。"""
+    conn.execute("BEGIN")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 @contextmanager
@@ -96,10 +137,19 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
 
 def reset_db(conn: sqlite3.Connection) -> None:
     with immediate_transaction(conn):
+        affected = {
+            row[0]
+            for row in conn.execute(
+                "SELECT employee_no FROM payment_orders"
+                " UNION SELECT employee_no FROM receipts"
+            )
+        }
         conn.execute("DELETE FROM confirmation_items")
         conn.execute("DELETE FROM confirmations")
         conn.execute("DELETE FROM receipts")
         conn.execute("DELETE FROM payment_orders")
+        # 版本号只增不减：清空后旧页面持有的版本必然过期（不会因归零而“复活”）
+        bump_employee_revisions(conn, affected)
 
 
 def insert_orders(conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
@@ -116,6 +166,40 @@ def insert_receipts(conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
         " VALUES (?, ?, ?, ?, ?)",
         rows,
     )
+
+
+def bump_employee_revisions(conn: sqlite3.Connection, employee_nos: Iterable[str]) -> None:
+    """在调用方事务内把相关员工的状态版本 +1。"""
+    conn.executemany(
+        "INSERT INTO employee_revisions(employee_no, revision) VALUES (?, 1)"
+        " ON CONFLICT(employee_no) DO UPDATE SET revision = revision + 1",
+        [(e,) for e in sorted(set(employee_nos))],
+    )
+
+
+def employee_revisions(conn: sqlite3.Connection) -> Dict[str, int]:
+    return {
+        row["employee_no"]: row["revision"]
+        for row in conn.execute("SELECT employee_no, revision FROM employee_revisions")
+    }
+
+
+def get_or_create_token_secret(conn: sqlite3.Connection) -> str:
+    """建议依据令牌的签名密钥，随库持久化，容器重启后旧页面令牌仍可校验。"""
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key='token_secret'"
+    ).fetchone()
+    if row is not None:
+        return row[0]
+    candidate = secrets.token_hex(32)
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta(key, value) VALUES ('token_secret', ?)",
+        (candidate,),
+    )
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key='token_secret'"
+    ).fetchone()
+    return row[0]
 
 
 def count_orders(conn: sqlite3.Connection) -> int:
@@ -162,7 +246,10 @@ def used_receipt_nos(conn: sqlite3.Connection) -> set:
 
 
 def save_confirmation(
-    conn: sqlite3.Connection, pairing: dict, now: float
+    conn: sqlite3.Connection,
+    pairing: dict,
+    employees_by_order: dict,
+    now: float,
 ) -> int:
     """在已开启的事务内写入确认，返回 confirmation id。"""
     cur = conn.execute(
@@ -189,6 +276,8 @@ def save_confirmation(
         "UPDATE receipts SET status='used' WHERE receipt_no=?",
         [(r,) for r in receipt_nos],
     )
+    # 确认后这些员工的开放池变化，其他持有旧快照的页面必须重新计算
+    bump_employee_revisions(conn, [employees_by_order[o] for o in order_nos])
     return confirmation_id
 
 

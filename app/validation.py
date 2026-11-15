@@ -141,3 +141,40 @@ def demo_receipts() -> List[Dict]:
 def demo_supplement_receipt() -> Dict:
     """补录 E005 的回执：3000 整笔，补录后 PO...005 成为新的确定配对。"""
     return {"receipt_no": "RC20261011", "employee_no": "E005", "amount": 3000, "period": "2026-10"}
+
+
+# ------------------------------------------------------- 过期建议演示数据
+#
+# 场景：E710 只有一张 100 分支付单和一条 100 分回执（确定配对）。
+# 另一窗口补录同员工第二条 100 分回执后，原配对失去唯一性；若旧页面
+# 仍提交补录前的建议，服务端必须拒绝并提示刷新。
+
+STALE_PERIOD = "2026-10"
+
+
+def stale_demo_orders() -> List[Dict]:
+    return [
+        {"order_no": "PO7100", "employee_no": "E710", "amount": 100, "period": STALE_PERIOD},
+        {"order_no": "PO8100", "employee_no": "E810", "amount": 200, "period": STALE_PERIOD},
+    ]
+
+
+def stale_demo_receipts() -> List[Dict]:
+    return [
+        {"receipt_no": "RC7100", "employee_no": "E710", "amount": 100, "period": STALE_PERIOD},
+        {"receipt_no": "RC8100", "employee_no": "E810", "amount": 200, "period": STALE_PERIOD},
+    ]
+
+
+def stale_demo_supplement_same() -> Dict:
+    """同员工补录：E710 第二条 100 分回执，使原配对不再唯一。"""
+    return {"receipt_no": "RC7101", "employee_no": "E710", "amount": 100, "period": STALE_PERIOD}
+
+
+def stale_demo_supplement_other() -> Dict:
+    """其他员工补录：E810 多一条 100 分回执。
+
+    本页确认的是 E710 的配对，E810 的变化与其无关，因此整组确认仍应成功；
+    E810 自己的建议依据已变，若本页想确认 PO8100 则需要刷新。
+    """
+    return {"receipt_no": "RC8101", "employee_no": "E810", "amount": 100, "period": STALE_PERIOD}

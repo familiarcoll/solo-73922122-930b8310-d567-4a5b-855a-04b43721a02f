@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -27,6 +28,20 @@ def load_demo(client):
     r = client.post("/api/demo")
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def snapshot(client):
+    """取当前建议快照（含依据令牌）。"""
+    r = client.get("/api/state")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def confirm(client, items, basis=None, **kwargs):
+    """带建议依据发起确认；缺省使用当前快照令牌。"""
+    if basis is None:
+        basis = snapshot(client)["suggestion_basis"]
+    return client.post("/api/confirm", json={"items": items, "basis": basis}, **kwargs)
 
 
 # ------------------------------------------------------------- 基础流程
@@ -108,11 +123,11 @@ def test_period_must_match(client):
 
 def test_confirm_certain_group_and_evidence(client):
     load_demo(client)
-    payload = {"items": [
+    items = [
         {"order_no": "PO20261001", "receipt_nos": ["RC20261001", "RC20261002"]},
         {"order_no": "PO20261002", "receipt_nos": ["RC20261003"]},
-    ]}
-    r = client.post("/api/confirm", json=payload)
+    ]
+    r = confirm(client, items)
     assert r.status_code == 200, r.text
     cid = r.json()["confirmation_id"]
 
@@ -132,17 +147,17 @@ def test_confirm_certain_group_and_evidence(client):
 def test_confirm_rejects_reused_receipt_and_rolls_back(client):
     load_demo(client)
     # 先确认 PO...003（占用 RC...004/005/006）
-    r = client.post("/api/confirm", json={"items": [
+    r = confirm(client, [
         {"order_no": "PO20261003", "receipt_nos": ["RC20261004", "RC20261005", "RC20261006"]},
-    ]})
+    ])
     assert r.status_code == 200
     # 再尝试占用已使用回执 RC...004 → 整组失败（只带未确认订单，排除订单状态干扰）
     # RC...004(2000) + RC...007(1500) + RC...009(1000) = 4500 ≠ 4000，
     # 换成 RC...007+RC...008 本身合法，再额外拼入已占用的 RC...004 触发占用冲突
-    r = client.post("/api/confirm", json={"items": [
+    r = confirm(client, [
         {"order_no": "PO20261002", "receipt_nos": ["RC20261003"]},
         {"order_no": "PO20261004", "receipt_nos": ["RC20261004", "RC20261007", "RC20261009"]},
-    ]})
+    ])
     assert r.status_code == 409 and "已被占用" in r.json()["detail"]
     # 同组里合法的那一项也必须回滚：PO...002、PO...004 仍是 open
     state = client.get("/api/state").json()
@@ -154,18 +169,18 @@ def test_confirm_rejects_reused_receipt_and_rolls_back(client):
 
 def test_confirm_rejects_amount_mismatch(client):
     load_demo(client)
-    r = client.post("/api/confirm", json={"items": [
+    r = confirm(client, [
         {"order_no": "PO20261001", "receipt_nos": ["RC20261001"]},  # 3000 != 7000
-    ]})
+    ])
     assert r.status_code == 409 and "金额不平" in r.json()["detail"]
 
 
 def test_manual_confirm_pending_combo(client):
     """待核组合允许人工选择确认。"""
     load_demo(client)
-    r = client.post("/api/confirm", json={"items": [
+    r = confirm(client, [
         {"order_no": "PO20261004", "receipt_nos": ["RC20261007", "RC20261008"]},
-    ]})
+    ])
     assert r.status_code == 200
     state = client.get("/api/state").json()
     used = {rc["receipt_no"] for rc in state["receipts"] if rc["status"] == "used"}
@@ -200,9 +215,9 @@ def test_supplement_recalculates_and_other_employee_unchanged(client):
 def test_supplement_other_employee_keeps_confirmation(client):
     """补录其他员工回执不影响已确认依据。"""
     load_demo(client)
-    client.post("/api/confirm", json={"items": [
+    confirm(client, [
         {"order_no": "PO20261002", "receipt_nos": ["RC20261003"]},
-    ]})
+    ])
     client.post("/api/demo/supplement")
     state = client.get("/api/state").json()
     assert len(state["confirmed"]) == 1
@@ -213,9 +228,9 @@ def test_supplement_other_employee_keeps_confirmation(client):
 
 def test_persistence_across_reconnect(client):
     load_demo(client)
-    client.post("/api/confirm", json={"items": [
+    confirm(client, [
         {"order_no": "PO20261002", "receipt_nos": ["RC20261003"]},
-    ]})
+    ])
     # 模拟重启：丢弃连接、重新建连接（lifespan 不会清库）
     conn = db.connect()
     try:
@@ -250,10 +265,11 @@ def test_concurrent_confirm_no_double_occupancy(client):
     ]})
     barrier = threading.Barrier(2)
     results = []
+    shared_basis = snapshot(client)["suggestion_basis"]
 
     def worker(payload):
         barrier.wait()
-        r = client.post("/api/confirm", json=payload)
+        r = client.post("/api/confirm", json={**payload, "basis": shared_basis})
         results.append((r.status_code, r.json()))
 
     t1 = threading.Thread(target=worker, args=({"items": [
@@ -268,7 +284,8 @@ def test_concurrent_confirm_no_double_occupancy(client):
     ok = [r for r in results if r[0] == 200]
     fail = [r for r in results if r[0] != 200]
     assert len(ok) == 1 and len(fail) == 1
-    assert "已被占用" in fail[0][1]["detail"]
+    # 落败方无论是因建议过期还是回执被占用，都必须整组拒绝
+    assert fail[0][1]["code"] == "stale_suggestion" or "已被占用" in fail[0][1]["detail"]
 
     state = client.get("/api/state").json()
     statuses = {o["order_no"]: o["status"] for o in state["orders"]}
@@ -300,7 +317,227 @@ def test_concurrent_confirm_no_double_occupancy(client):
         conn.close()
 
 
-# ------------------------------------------------------------- CSV 导入/下载
+# ------------------------------------------------------------- 过期建议拦截
+
+def setup_stale_scenario(client):
+    r = client.post("/api/demo/stale")
+    assert r.status_code == 200, r.text
+    state = r.json()["state"]
+    certain = {c["order"]["order_no"]: [rc["receipt_no"] for rc in c["receipts"]]
+               for c in state["suggestion"]["certain"]}
+    assert certain == {"PO7100": ["RC7100"], "PO8100": ["RC8100"]}
+    return state["suggestion_basis"]
+
+
+def test_stale_same_employee_supplement_rejects_old_page(client):
+    old_basis = setup_stale_scenario(client)
+    # 另一窗口同员工补录：金额仍相等、回执 RC7100 未被占用
+    r = client.post("/api/demo/stale/supplement-same")
+    assert r.status_code == 200
+
+    # 旧页面的原配对仍能通过“金额相等/同员工/未占用”的静态校验，但必须因过期被拒
+    r = confirm(client, [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}], basis=old_basis)
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "stale_suggestion"
+    assert "刷新" in r.json()["detail"]
+
+    state = snapshot(client)
+    statuses = {o["order_no"]: o["status"] for o in state["orders"]}
+    receipt_st = {rc["receipt_no"]: rc["status"] for rc in state["receipts"]}
+    assert statuses == {"PO7100": "open", "PO8100": "open"}
+    assert receipt_st["RC7100"] == "open" and receipt_st["RC7101"] == "open"
+    assert state["confirmed"] == []
+
+
+def test_stale_rejection_is_group_atomic_other_items_unchanged(client):
+    old_basis = setup_stale_scenario(client)
+    client.post("/api/demo/stale/supplement-same")
+    # 一组里同时有合法项（其他员工）与过期项：整组不得写入
+    r = confirm(client, [
+        {"order_no": "PO8100", "receipt_nos": ["RC8100"]},
+        {"order_no": "PO7100", "receipt_nos": ["RC7100"]},
+    ], basis=old_basis)
+    assert r.status_code == 409 and r.json()["code"] == "stale_suggestion"
+    state = snapshot(client)
+    assert {o["order_no"]: o["status"] for o in state["orders"]} == {
+        "PO7100": "open", "PO8100": "open"
+    }
+    assert state["confirmed"] == []
+
+
+def test_stale_other_employee_supplement_does_not_block(client):
+    old_basis = setup_stale_scenario(client)
+    # 另一窗口补录的是其他员工 E810 的回执
+    r = client.post("/api/demo/stale/supplement-other")
+    assert r.status_code == 200
+    # 本页确认组只含 E710：其他员工的补录不阻止本组确认，即使本页未刷新
+    r = confirm(client, [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}], basis=old_basis)
+    assert r.status_code == 200, r.text
+    state = snapshot(client)
+    statuses = {o["order_no"]: o["status"] for o in state["orders"]}
+    assert statuses == {"PO7100": "confirmed", "PO8100": "open"}
+
+    # 对照：若坚持用旧依据确认被补录员工 E810 的单，则应过期拒绝
+    r = confirm(client, [{"order_no": "PO8100", "receipt_nos": ["RC8100"]}], basis=old_basis)
+    assert r.status_code == 409 and r.json()["code"] == "stale_suggestion"
+
+
+def test_refresh_allows_manual_pending_selection_without_auto_resubmit(client):
+    old_basis = setup_stale_scenario(client)
+    client.post("/api/demo/stale/supplement-same")
+    r = confirm(client, [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}], basis=old_basis)
+    assert r.status_code == 409
+
+    # 刷新后的建议：PO7100 变为待核（两种 100 分组合），不自动勾选/重提
+    fresh = snapshot(client)
+    pending = {p["order"]["order_no"]: p["combos"] for p in fresh["suggestion"]["pending"]}
+    assert set(pending) == {"PO7100"}
+    combos = {frozenset(rc["receipt_no"] for rc in combo) for combo in pending["PO7100"]}
+    assert combos == {frozenset({"RC7100"}), frozenset({"RC7101"})}
+    fresh_basis = fresh["suggestion_basis"]
+    assert fresh_basis != old_basis
+
+    # 用刷新后的依据 + 人工选择的组合（选补录前的那一条）可以确认
+    r = confirm(client, [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}], basis=fresh_basis)
+    assert r.status_code == 200
+    state = snapshot(client)
+    assert {o["order_no"]: o["status"] for o in state["orders"]}["PO7100"] == "confirmed"
+    assert {rc["receipt_no"]: rc["status"] for rc in state["receipts"]}["RC7100"] == "used"
+
+
+def test_confirm_requires_valid_basis(client):
+    setup_stale_scenario(client)
+    r = client.post("/api/confirm", json={"items": [
+        {"order_no": "PO7100", "receipt_nos": ["RC7100"]},
+    ]})
+    assert r.status_code == 400 and "建议依据" in r.json()["detail"]
+
+    r = client.post("/api/confirm", json={
+        "items": [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}],
+        "basis": "forged.token",
+    })
+    assert r.status_code == 400 and "无效" in r.json()["detail"]
+
+    # 篡改签名
+    good = snapshot(client)["suggestion_basis"]
+    body, sig = good.split(".")
+    r = client.post("/api/confirm", json={
+        "items": [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}],
+        "basis": body + "." + ("A" if sig[0] != "A" else "B") + sig[1:],
+    })
+    assert r.status_code == 400 and "无效" in r.json()["detail"]
+
+
+def test_concurrent_supplement_and_confirm_rejects_stale(client):
+    """补录与确认并发：补录先拿到写锁并在确认校验前提交，旧依据必须被拒。"""
+    old_basis = setup_stale_scenario(client)
+    held = threading.Event()
+    release = threading.Event()
+    results = {}
+
+    def hold_lock_and_supplement():
+        conn = db.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            db.insert_receipts(conn, [(
+                "RC7101", "E710", 100, "2026-10", time.time(),
+            )])
+            db.bump_employee_revisions(conn, ["E710"])
+            held.set()
+            # 确认请求此时已被挡在 BEGIN IMMEDIATE 之外
+            release.wait(timeout=10)
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def do_confirm():
+        held.wait(timeout=10)
+        r = client.post("/api/confirm", json={
+            "items": [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}],
+            "basis": old_basis,
+        })
+        results["confirm"] = (r.status_code, r.json())
+
+    t1 = threading.Thread(target=hold_lock_and_supplement)
+    t2 = threading.Thread(target=do_confirm)
+    t1.start(); t2.start()
+    held.wait(timeout=10)
+    time.sleep(0.4)  # 让确认请求先进入等待写锁的状态
+    release.set()
+    t1.join(); t2.join()
+
+    code, body = results["confirm"]
+    assert code == 409 and body["code"] == "stale_suggestion"
+
+    state = snapshot(client)
+    assert state["confirmed"] == []
+    assert {o["order_no"]: o["status"] for o in state["orders"]} == {
+        "PO7100": "open", "PO8100": "open"
+    }
+
+
+def test_write_failure_rolls_back_whole_group(client, monkeypatch):
+    """写入中途失败（如数据库异常）时整组回滚：单据、回执、确认批次都不留痕。"""
+    setup_stale_scenario(client)
+    basis_token = snapshot(client)["suggestion_basis"]
+    real_save = db.save_confirmation
+
+    def failing_save(conn, pairing, employees_by_order, now):
+        real_save(conn, pairing, employees_by_order, now)  # 已写入批次/明细/状态
+        raise sqlite3.OperationalError("disk I/O error (simulated)")
+
+    monkeypatch.setattr(db, "save_confirmation", failing_save)
+    with pytest.raises(sqlite3.OperationalError):
+        client.post("/api/confirm", json={
+            "items": [
+                {"order_no": "PO7100", "receipt_nos": ["RC7100"]},
+                {"order_no": "PO8100", "receipt_nos": ["RC8100"]},
+            ],
+            "basis": basis_token,
+        })
+
+    monkeypatch.setattr(db, "save_confirmation", real_save)
+    state = snapshot(client)
+    assert state["confirmed"] == []
+    assert {o["order_no"]: o["status"] for o in state["orders"]} == {
+        "PO7100": "open", "PO8100": "open"
+    }
+    assert {rc["receipt_no"]: rc["status"] for rc in state["receipts"]} == {
+        "RC7100": "open", "RC8100": "open"
+    }
+    conn = db.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM confirmations").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM confirmation_items").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_basis_token_survives_restart(client):
+    """签名密钥随库持久化：重启后旧页面（未刷新）的依据仍按真实状态校验。"""
+    import app.main as main_module
+
+    old_basis = setup_stale_scenario(client)
+    saved_secret = main_module.TOKEN_SECRET
+    try:
+        # 模拟进程重启：丢掉内存密钥，走 lifespan 从库内重新加载
+        main_module.TOKEN_SECRET = ""
+        with TestClient(app):
+            r = confirm(client, [{"order_no": "PO7100", "receipt_nos": ["RC7100"]}],
+                        basis=old_basis)
+            assert r.status_code == 200, r.text
+    finally:
+        main_module.TOKEN_SECRET = saved_secret
+
+
+def test_basis_snapshot_consistent_with_suggestion(client):
+    """建议与其依据令牌来自同一已提交读快照；员工数据变化后令牌随之变化。"""
+    load_demo(client)
+    state = snapshot(client)
+    assert state["suggestion_basis"]
+    client.post("/api/demo/supplement")
+    assert snapshot(client)["suggestion_basis"] != state["suggestion_basis"]
+
 
 def test_csv_import_and_evidence_download(client):
     csv_orders = "order_no,employee_no,amount,period\nC1,E1,500,2026-10\nC2,E2,700,2026-10\n"
@@ -316,10 +553,10 @@ def test_csv_import_and_evidence_download(client):
 
     state = client.get("/api/state").json()["suggestion"]
     assert state["max_matched"] == 2
-    r = client.post("/api/confirm", json={"items": [
+    r = confirm(client, [
         {"order_no": "C1", "receipt_nos": ["CR1", "CR2"]},
         {"order_no": "C2", "receipt_nos": ["CR3"]},
-    ]})
+    ])
     assert r.status_code == 200
     r = client.get("/api/evidence.csv")
     assert r.headers["content-type"].startswith("text/csv")
